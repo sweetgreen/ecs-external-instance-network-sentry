@@ -50,11 +50,17 @@ In reference to the diagram:
   - eINS updates Docker restart policy updated to `on-failure` for each ECS managed container [4]. This ensures that any ECS managed containers will be restarted if exiting due to error, the Docker daemon is restarted, or the external instance is rebooted.
 
 - When the ECS control-plane becomes reachable:
-  - ECS managed containers that have been automatically restarted by the Docker daemon during network outage are stopped and removed.**
+  - The behavior depends on the configured `--restart-strategy`:
+    - **`cleanup` (default)**: ECS managed containers that have been automatically restarted by the Docker daemon during network outage are stopped and removed.** ECS will relaunch these tasks.
+    - **`preserve`**: Restarted containers continue running. They may become orphaned by ECS but remain available.
+    - **`graceful-cutover`**: Agent remains paused until ECS launches replacement containers, then restarted containers are stopped.
+    - **`manual`**: Agent remains paused, requiring manual intervention before any changes.
   - ECS managed containers that have not been automatically restarted during network outage have their Docker restart policy set back to `no`.
-  - The local ECS agent is un-paused.
+  - The local ECS agent is un-paused (except for `manual` strategy when containers were restarted).
 
     > *At this point the operational environment has been restored back to the [Connected Operation](#Connected-Operation) scenario. eINS will continue to monitor for network outage or ECS control-plane error.*
+
+    > *For critical services where unexpected downtime must be avoided, see the [Configuration Parameters](#Configuration-Parameters) section for information on the `--restart-strategy` parameter.*
 
 #### Notes
 
@@ -154,6 +160,68 @@ Specify log data event severity.
 
 ```bash
 $ python3 ecs-external-instance-network-sentry.py --region ap-southeast-2 --interval 15 --retries 5 --logfile /mypath/myfile.log --loglevel DEBUG
+```
+
+##### `--restart-strategy`
+
+Specify the strategy for handling containers that were restarted during a network outage when connectivity is restored. This parameter is critical for deployments where unexpected container downtime must be avoided.
+
+- optional=yes
+
+- default=cleanup
+
+- choices=cleanup, preserve, graceful-cutover, manual
+
+**Available Strategies:**
+
+1. **cleanup** (default) - Original behavior
+   - Stops and removes containers that were restarted during the outage
+   - ECS control-plane will relaunch these tasks once the agent reconnects
+   - Results in brief downtime during the transition
+   - Best for: Non-critical services where brief downtime is acceptable
+
+2. **preserve** - Keep all restarted containers running
+   - Does NOT stop or remove containers that restarted during the outage
+   - Simply resets their restart policy back to "no" and unpauses the ECS agent
+   - Containers continue running without interruption
+   - May result in orphaned containers (no longer managed by ECS)
+   - Best for: Critical services where zero downtime is required and you can handle orphaned containers manually during maintenance
+
+3. **graceful-cutover** - Wait for ECS to launch replacements before stopping old containers
+   - Keeps ECS agent paused after connectivity is restored
+   - Waits for ECS control-plane to launch replacement containers
+   - Only stops old restarted containers after replacements are detected and running
+   - Provides zero-downtime cutover from restarted containers to ECS-managed replacements
+   - Has configurable timeout (see `--cutover-timeout`)
+   - Best for: Critical services that need zero downtime but want ECS to eventually take over management
+
+4. **manual** - Require manual intervention
+   - Keeps ECS agent paused when connectivity returns if any containers were restarted
+   - Resets restart policies but does NOT stop restarted containers
+   - Logs a warning requiring manual review and intervention
+   - Operator must manually unpause the ECS agent when ready
+   - Best for: High-security or highly-critical environments where operator approval is required before any changes
+
+```bash
+# Example: Use preserve strategy for critical services
+$ python3 ecs-external-instance-network-sentry.py --region ap-southeast-2 --restart-strategy preserve
+
+# Example: Use graceful-cutover with custom timeout
+$ python3 ecs-external-instance-network-sentry.py --region ap-southeast-2 --restart-strategy graceful-cutover --cutover-timeout 600
+```
+
+##### `--cutover-timeout`
+
+Specify the timeout in seconds for the `graceful-cutover` strategy to wait for ECS to launch replacement containers. If the timeout is reached before replacements are detected, the agent will be unpaused and a warning will be logged requiring manual intervention.
+
+- optional=yes
+
+- default=300 (5 minutes)
+
+- only applies when `--restart-strategy graceful-cutover` is used
+
+```bash
+$ python3 ecs-external-instance-network-sentry.py --region ap-southeast-2 --restart-strategy graceful-cutover --cutover-timeout 600
 ```
 
 ## Installation
@@ -347,9 +415,19 @@ Logfile will rotate at 5Mb and a history of the five most recent logfiles will b
 
 ## Considerations
 
-The eINS currently has the following limitation:
+### Restart Strategy Selection
 
- - As described in the [Disconnected Operation](#Disconnected-Operation) section, containers that have been restarted during a period where the ECS control-plane is unavailable will be stopped once the ECS control-plane becomes available.
+The default `cleanup` restart strategy will stop and remove containers that were restarted during a network outage when connectivity is restored. This results in brief downtime as ECS relaunches the tasks.
+
+**For critical services where unexpected downtime must be avoided**, consider using one of the alternative restart strategies:
+
+- **`graceful-cutover`** (recommended for most critical services): Waits for ECS to launch replacement containers before stopping the restarted ones, providing zero-downtime transition while maintaining ECS control.
+
+- **`preserve`**: Keeps restarted containers running indefinitely, accepting that they may become orphaned by ECS. You'll need to manually clean up orphaned containers during maintenance windows.
+
+- **`manual`**: Requires operator approval before any changes are made after connectivity is restored, giving you full control over the transition.
+
+See the [Configuration Parameters](#Configuration-Parameters) section for detailed information on each restart strategy and the `--restart-strategy` parameter.
 
 ## Security
 
